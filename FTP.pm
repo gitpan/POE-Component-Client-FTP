@@ -20,7 +20,7 @@ use POE qw(Wheel::SocketFactory Wheel::ReadWrite
 
 use vars qw(@ISA @EXPORT $VERSION $poe_kernel);
 
-$VERSION = 0.06;
+$VERSION = 0.07;
 
 @ISA = qw(Exporter);
 @EXPORT = qw(FTP_PASSIVE FTP_ACTIVE FTP_MANUAL FTP_ASCII FTP_BINARY);
@@ -43,12 +43,15 @@ sub FTP_BINARY  () { 2 }
 
 # tells the dispatcher which states support which events
 my $state_map =
-  { _init  => { "_start"        => \&do_init_start,
-		"cmd_connected" => \&handler_init_connected,
-		"success"       => \&handler_init_success,
+  { _init  => { "_start"            => \&do_init_start,
+		"connect"           => \&do_init_start,
+		"cmd_connected"     => \&handler_init_connected,
+		"cmd_connect_error" => \&handler_init_error,
+		"success"           => \&handler_init_success,
+		"timeout"           => \&handler_init_error
 	      },
 
-    _stop  => { "_start" => \&do_stop
+    stop   => { "_start" => \&do_stop
 	      },
 
     login  => { "login"        => \&do_login_send_username,
@@ -231,6 +234,9 @@ sub spawn {
 sub do_init_start {
   my ($kernel, $heap) = @_[KERNEL, HEAP];
 
+  # set timeout for connection
+  $kernel->delay( "timeout", $heap->{attr_timeout} );
+
   # connect to command port
   $heap->{cmd_sock_wheel} = POE::Wheel::SocketFactory->new(
     SocketDomain   => AF_INET,
@@ -248,7 +254,7 @@ sub do_init_start {
 # try to clean up
 # client responsibility to ensure things are all complete
 sub do_stop {
-  my ($kernel, $heap) = @_[KERNEL, HEAP];
+  my $heap = $poe_kernel->get_active_session()->get_heap();
 
   warn "cleaning up" if DEBUG;
 
@@ -257,7 +263,7 @@ sub do_stop {
   delete $heap->{data_rw_wheel};
   delete $heap->{data_sock_wheel};
 
-  $kernel->alias_remove( $heap->{alias} );
+  $poe_kernel->alias_remove( $heap->{alias} );
 }
 
 # server responses on command connection
@@ -481,6 +487,9 @@ sub do_put_close {
 sub handler_init_connected {
     my ($kernel, $heap, $socket) = @_[KERNEL, HEAP, ARG0];
 
+    # clear the timeout
+    $kernel->delay("timeout");
+
     $heap->{cmd_rw_wheel} = POE::Wheel::ReadWrite->new(
 	Handle     => $socket,
         Filter     => POE::Filter::Line->new( Literal => EOL ),
@@ -490,11 +499,27 @@ sub handler_init_connected {
     );
 }
 
+# connect to server failed, clean up
+sub handler_init_error {
+    my ($kernel, $heap) = @_[KERNEL, HEAP];
+
+    # clear the timeout
+    $kernel->delay("timeout");
+
+    delete $heap->{cmd_sock_wheel};
+    send_event( "connect_error" );
+}
+
 # wheel established, log in if we can
 sub handler_init_success {
-  my ($kernel, $heap) = @_[KERNEL, HEAP];
+  my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
 
-  send_event('connected');
+  my $status = substr($input, 0, 3);
+  my $line = substr($input, 4);
+
+  send_event( "connected", 
+	      $status, $line );
+
   goto_state("login");
 
   if ( defined $heap->{user} and defined $heap->{pass} ) {
@@ -961,7 +986,7 @@ Untested.
 
 =item RemotePort     - ftp port
 
-=item Timeout        - unused
+=item Timeout        - timeout for connection to server
 
 =item BlockSize      - sets the recieve buffer size.  see BUGS
 
@@ -1019,6 +1044,13 @@ and closed.
 
 =head1 OUTPUT
 
+Output for connect consists of "connected" upon successful connection to
+server, and "connect_error" if the connection fails or times out.  Upon
+failure, you can post a "connect" message to retry the connection.
+
+Output for login is either "authenticated" if the login was accepted, or
+"login_error" if it was rejected.
+
 Output is for "simple" ftp events is simply "event".  Error cases are
 "event_error".  ARG0 is the numeric code, ARG1 is the text response,
 and ARG2 is the parameter you made the call with.  This is useful since
@@ -1067,6 +1099,8 @@ requiring the calling script to do standard file io in handlers.
 
 =head1 BUGS
 
+=over
+
 =item BlockSize
 
 To do the blocksize, I simply rely on the BlockSize parameter in the
@@ -1091,5 +1125,13 @@ LocalAddr in the constructor and it all works fine.
 Copyright (c) 2002 Michael Ching. All rights reserved. This program is free
 software; you can redistribute it and/or modify it under the same terms as
 Perl itself.
+
+
+
+
+
+
+
+
 
 

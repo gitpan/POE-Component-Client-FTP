@@ -22,6 +22,7 @@ POE::Session->create
   (
    inline_states => {
 		     _start        => \&start,
+		     connected     => \&connected,
 		     authenticated => \&authenticated,
 		     login_error   => \&login_error,
 		     ls_data       => \&ls_data,
@@ -41,6 +42,10 @@ sub start {
      Filters => { ls => new POE::Filter::Ls },
      Events => [qw(all)]
     );
+}
+
+sub connected {
+  print "Connected: '$_[ARG0]' '$_[ARG1]'\n";
 }
 
 sub authenticated {

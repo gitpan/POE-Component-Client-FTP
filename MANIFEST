@@ -4,3 +4,6 @@ Makefile.PL
 MANIFEST
 README
 test.pl
+samples/list.pl
+samples/sync.pl
+samples/dotfer.pl

@@ -1,5 +1,14 @@
 Revision history for Perl extension POE::Component::Client::FTP.
 
+0.07 (08/25/02)
+  - connected now posts the server message, that should be the last of those
+  - updated samples/list.pl to test connect message
+  - dir and ls commands are backwards from what most ftp clients use. I'll
+    probably fix it later if I need to do some other major change to break
+    backwards compatibility
+  - fixed stop state so the component should unload upon disconnect
+  - added code for timeout to work, have not tested it
+
 0.06 (07/15/02)
   - active mode implemented
   - more attributes respected
