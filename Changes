@@ -1,0 +1,6 @@
+Revision history for Perl extension POE::Component::Client::FTP.
+
+0.02 - more information in events outputted
+       added some documentation
+
+0.01 - initial release
