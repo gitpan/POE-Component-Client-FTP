@@ -1,16 +1,32 @@
+#!/usr/bin/perl -w 
+
+# Usage:
+# sync.pl host:user:pass /path/to/file
+#
+# Shows the lazy way to upload a file letting the module handle
+# all queueing.  sync.pl shows a cleaner way for larger files.
+#
+
+# sub POE::Component::Client::FTP::DEBUG         () { 1 };
+# sub POE::Kernel::TRACE_EVENTS () { 1 }
+
+use strict;
 use POE;
 use POE::Component::Client::FTP;
 $|++;
 
+my ($conn, $file) = @ARGV;
+my ($host,$user,$pass) = split /:/, $conn;
+
 POE::Session->create
     (
      inline_states => {
-		       "_start"    => \&start,
-		       "authenticated" => \&authenticated,
-		       put_ready => \&put_ready,
-		       put_closed => \&put_closed,
-		       put_flushed => \&put_flushed,
-		       put_error => \&put_error
+		       _start        => \&start,
+		       authenticated => \&authenticated,
+		       put_ready     => \&put_ready,
+		       put_closed    => \&put_closed,
+		       put_flushed   => \&put_flushed,
+		       put_error     => \&put_error
 		      }     
     );
 
@@ -19,9 +35,9 @@ sub start {
     (
      Alias      => 'ftp',
      
-     RemoteAddr => '',
-     Username   => '',
-     Password   => '',
+     RemoteAddr => $host,
+     Username   => $user,
+     Password   => $pass,
 
      Events => [qw(all)]
     );
@@ -33,9 +49,9 @@ sub authenticated {
 }
 
 sub put_ready {
-  my ($heap) = @_[HEAP];
+  my ($heap) = $_[HEAP];
 
-  open FILE, "$ENV{HOME}/public_html/test.act" or die $!;
+  open FILE, $file or die $!;
   my $buf;
   while (read FILE, $buf, 10240) {
     $heap->{bs} += length $buf;
@@ -58,9 +74,9 @@ sub put_error {
 }
 
 sub put_closed {
-  my ($heap) = @_[HEAP];
+  my ($heap) = $_[HEAP];
 
-  print join "\n", "X", $heap->{bs}, $heap->{br}, $heap->{bs} - $heap->{br};
+  print join "\n", "X", $heap->{bs}, $heap->{br}, $heap->{bs} - $heap->{br}, "";
   $poe_kernel->post('ftp', 'quit');
 }
 

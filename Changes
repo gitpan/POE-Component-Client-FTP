@@ -1,5 +1,14 @@
 Revision history for Perl extension POE::Component::Client::FTP.
 
+0.05 (05/25/02)
+  - ls and dir now use Filter::Line, get and put use Filter::Stream
+  - put_close sends a put_flushed message so that if you close after
+    last data item had been flushed, it will be able to detect it
+  - adding more control over what to show in DEBUG modes
+  - added another sample demonstrating ls, put and get
+  - fixed a variety of bugs with _flushed being sent extraneously in
+    put methods
+	
 0.04 (05/23/02)
   - added POE to prerequisite list, hopefully make test works now
   - improved handling for put_ using a queue built on top of the Wheel

@@ -12,15 +12,19 @@ use warnings;
 use Carp;
 use vars qw($VERSION $poe_kernel);
 
-$VERSION = 0.04;
+$VERSION = 0.05;
 
 use POE qw( Wheel::SocketFactory Wheel::ReadWrite Filter::Stream );
 use Socket;
 
 # use Data::Dumper;
 
-sub DEBUG () { 0 }
-sub EOL   () { "\015\012" }
+BEGIN { 
+  eval 'sub DEBUG         () { 0 }' unless defined &DEBUG;
+  eval 'sub DEBUG_COMMAND () { 0 }' unless defined &DEBUG_COMMAND;
+}
+
+sub EOL           () { "\015\012" }
 
 # tells the dispatcher which states support which events
 my $state_map = 
@@ -99,6 +103,12 @@ my %command_map  = ( CD    => "CWD",
 
 		     DELETE => "DELE",
 		   );
+
+
+my %filter = ( dir => new POE::Filter::Line( Literal => EOL ),
+	       ls  => new POE::Filter::Line( Literal => EOL ),
+	       get => new POE::Filter::Stream()
+	     );
 
 # create a new POE::Component::Client::FTP object
 sub spawn {
@@ -346,7 +356,7 @@ sub do_put {
 # data connection made
 sub handler_put_connected {
   my ($kernel, $heap, $socket) = @_[KERNEL, HEAP, ARG0];
-  
+
   $heap->{data_rw_wheel} = POE::Wheel::ReadWrite->new(
     Handle       => $socket,
     Filter       => POE::Filter::Stream->new(),
@@ -363,26 +373,32 @@ sub handler_put_flushed {
 
   warn "data flushed " . $heap->{complex_stack}->{last_length} if DEBUG;
 
-  send_event( "put_flushed",
-	      $heap->{complex_stack}->{last_length},
-	      $heap->{complex_stack}->{command}->[1] )
-    if $heap->{complex_stack}->{last_length};  
+  # if no packet was pending, this was simply to get things going or to
+  # check for suicide and thus will confuse the user if sent
+  if ($heap->{complex_stack}->{pending}) {
+    $heap->{complex_stack}->{pending} = 0;
+    
+    send_event( "put_flushed",
+		$heap->{complex_stack}->{last_length},
+		$heap->{complex_stack}->{command}->[1] )
+      if $heap->{complex_stack}->{last_length};  
+  }
+
+  warn "Q||: " . scalar @{$heap->{complex_stack}->{sendq}} if DEBUG;
 
   # we use an internal sendq and send lines as each line is sent
   # this way we can give the user feedback as to the status of the upload
   # so, whenever data is flushed send the next packet
   if ( defined(my $line = shift @{$heap->{complex_stack}->{sendq}}) ) {
-    warn "sending queued packet" if DEBUG;
+    warn "sending queued packet: " . length ($line) if DEBUG;
 
-    $heap->{data_rw_wheel}->put($line);
-    
-    $kernel->post($session, 'data_flush');
-    
+    $heap->{complex_stack}->{pending} = 1;
+    $heap->{data_rw_wheel}->put($line);   
     $heap->{complex_stack}->{last_length} = length $line;
   }
   elsif ($heap->{data_suicidal}) {
-    warn "killing suicidal socket" if DEBUG;
-
+    warn "killing suicidal socket" . $heap->{data_rw_wheel}->get_driver_out_octets() if DEBUG;
+    
     delete $heap->{data_sock_wheel};
     delete $heap->{data_rw_wheel};
     $heap->{data_suicidal} = 0;
@@ -457,7 +473,11 @@ sub do_put_data {
   push @{ $heap->{complex_stack}->{sendq} }, $input;
 
   # send the first flushed event if this was the first item
-  $kernel->yield('data_flush') if @{ $heap->{complex_stack}->{sendq} } == 1;
+  unless ( @{ $heap->{complex_stack}->{sendq} } > 1
+	   or $heap->{complex_stack}->{pending} ) {
+    $kernel->yield('data_flush');
+  }
+  
 }
 
 # client request to end STOR command
@@ -466,6 +486,13 @@ sub do_put_close {
   warn "setting suicidal on" if DEBUG;
 
   $heap->{data_suicidal} = 1;
+
+  # if close is called when sendq is empty, we'll need to fake a flush
+  unless ( @{ $heap->{complex_stack}->{sendq} } > 0 
+	   or $heap->{complex_stack}->{pending} ) {
+    warn "empty sendq, manually flushing" if DEBUG;
+    $kernel->yield('data_flush');
+  }
 }
 
 ## login state
@@ -630,9 +657,10 @@ sub handler_complex_preliminary {
 # data connection established
 sub handler_complex_connected {
   my ($kernel, $heap, $socket) = @_[KERNEL, HEAP, ARG0];
-
+  
   $heap->{data_rw_wheel} = POE::Wheel::ReadWrite->new(
     Handle     => $socket,
+    Filter     => $filter{ $heap->{complex_stack}->[0] },
     InputEvent => 'data_input',
     ErrorEvent => 'data_error'
   );
@@ -709,6 +737,7 @@ sub dequeue_event {
   return unless @{$heap->{queue}};
 
   my $state = $heap->{queue}->[0]->[STATE];
+  warn "|| dequeue $state" if DEBUG;
 
   dispatch( @{ shift @{$heap->{queue}} } );
 }
@@ -767,7 +796,7 @@ sub command {
     $command = $command_map{$command} || $command;
     my $cmdstr = join( ' ', $command, @$cmd_args ? @$cmd_args : () );
 
-    warn "> $cmdstr" if DEBUG;
+    warn "> $cmdstr" if DEBUG || DEBUG_COMMAND;
     $heap->{cmd_rw_wheel}->put($cmdstr);
 }
 
@@ -973,12 +1002,6 @@ the POE manpage, the perl manpage, the Net::FTP module, RFC 959
 Perhaps I should be looking at the high_ and low_ marks given by the Wheel.
 Should also honor the block-size set forth by the spawn.  This is trivial
 by playing with sendq.
-
-=item Ensure that LIST data actually comes line by line
-
-It is going through a Filter->Stream so I am not really sure why it is working,
-but it does so I will look more in depth later.  Might need to conditionally
-use a Filter->Line depending on mode.
 
 =item Active transfer mode
 
