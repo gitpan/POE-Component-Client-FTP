@@ -1,5 +1,7 @@
 Revision history for Perl extension POE::Component::Client::FTP.
 
+0.03 - fixed 'cd' bug where cd was not mapped to cwd
+
 0.02 - more information in events outputted
        added some documentation
 

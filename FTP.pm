@@ -12,7 +12,7 @@ use warnings;
 use Carp;
 use vars qw($VERSION $poe_kernel);
 
-$VERSION = 0.02;
+$VERSION = 0.03;
 
 use POE qw( Wheel::SocketFactory Wheel::ReadWrite Filter::Stream );
 use Socket;
@@ -87,7 +87,8 @@ my $state_map =
   };
 
 # translation from posted signals to ftp commands
-my %command_map  = ( MKDIR => "MKD", 
+my %command_map  = ( CD    => "CWD",
+		     MKDIR => "MKD", 
 		     RMDIR => "RMD",
 			 
 		     LS  => "LIST",
