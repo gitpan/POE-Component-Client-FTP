@@ -9,31 +9,46 @@ package POE::Component::Client::FTP;
 
 use strict;
 use warnings;
+
 use Carp;
-use vars qw($VERSION $poe_kernel);
-
-$VERSION = 0.05;
-
-use POE qw( Wheel::SocketFactory Wheel::ReadWrite Filter::Stream );
+use Exporter;
 use Socket;
-
 # use Data::Dumper;
 
-BEGIN { 
+use POE qw(Wheel::SocketFactory Wheel::ReadWrite
+	   Filter::Stream Filter::Line Driver::SysRW);
+
+use vars qw(@ISA @EXPORT $VERSION $poe_kernel);
+
+$VERSION = 0.06;
+
+@ISA = qw(Exporter);
+@EXPORT = qw(FTP_PASSIVE FTP_ACTIVE FTP_MANUAL FTP_ASCII FTP_BINARY);
+
+BEGIN {
   eval 'sub DEBUG         () { 0 }' unless defined &DEBUG;
   eval 'sub DEBUG_COMMAND () { 0 }' unless defined &DEBUG_COMMAND;
 }
 
-sub EOL           () { "\015\012" }
+sub EOL         () { "\015\012" }
+
+# connection modes
+sub FTP_PASSIVE () { 1 }
+sub FTP_ACTIVE  () { 2 }
+
+# transfer modes
+sub FTP_MANUAL  () { 0 }
+sub FTP_ASCII   () { 1 }
+sub FTP_BINARY  () { 2 }
 
 # tells the dispatcher which states support which events
-my $state_map = 
+my $state_map =
   { _init  => { "_start"        => \&do_init_start,
 		"cmd_connected" => \&handler_init_connected,
 		"success"       => \&handler_init_success,
 	      },
 
-    _stop  => { "_start" => \&do_stop 
+    _stop  => { "_start" => \&do_stop
 	      },
 
     login  => { "login"        => \&do_login_send_username,
@@ -43,7 +58,7 @@ my $state_map =
 	      },
 
     global => { "cmd_input" => \&handler_cmd_input,
-		"cmd_error" => \&handler_cmd_error,
+		"cmd_error" => \&handler_cmd_error
 	      },
 
     ready  => { "_start" => \&dequeue_event,
@@ -52,23 +67,29 @@ my $state_map =
 
 		map ( { $_ => \&do_simple_command }
 		      qw{ cd cdup delete mdtm mkdir noop
-			  pwd rmdir site size type quit } 
+			  pwd rmdir site size type quit }
 		    ),
 
 		map ( { $_ => \&do_complex_command }
 		      qw{ dir ls get }
 		    ),
+
+		map ( { $_ => \&do_set_attribute }
+			qw{ trans_mode conn_mode blocksize timeout }
+		    ),
 	      },
 
-    put => { data_connected     => \&handler_put_connected,
-	     data_connect_error => \&handler_complex_connect_error,
-	     data_flush         => \&handler_put_flushed,
-	     success            => \&handler_put_success,
-	     preliminary        => \&handler_put_preliminary,
-	     failure            => \&handler_put_failure,
+    put => { data_flush         => \&handler_put_flushed,
 	     data_error         => \&handler_put_data_error,
-	     put_data           => \&do_put_data,
-	     put_close          => \&do_put_close
+	     
+             put_data           => \&do_put_data,
+	     put_close          => \&do_put_close,
+
+	     data_connected     => \&handler_complex_connected,
+	     data_connect_error => \&handler_complex_connect_error,
+	     preliminary        => \&handler_complex_preliminary,
+	     success            => \&handler_complex_success,
+	     failure            => \&handler_complex_failure,
 	   },
 
     rename => { "intermediate" => \&handler_rename_intermediate,
@@ -82,6 +103,7 @@ my $state_map =
 
     default_complex => { data_connected     => \&handler_complex_connected,
 			 data_connect_error => \&handler_complex_connect_error,
+			 data_flush         => \&handler_complex_flushed,
 			 preliminary        => \&handler_complex_preliminary,
 			 success            => \&handler_complex_success,
 			 failure            => \&handler_complex_failure,
@@ -92,9 +114,9 @@ my $state_map =
 
 # translation from posted signals to ftp commands
 my %command_map  = ( CD    => "CWD",
-		     MKDIR => "MKD", 
+		     MKDIR => "MKD",
 		     RMDIR => "RMD",
-			 
+
 		     LS  => "LIST",
 		     DIR => "NLST",
 		     GET => "RETR",
@@ -104,29 +126,26 @@ my %command_map  = ( CD    => "CWD",
 		     DELETE => "DELE",
 		   );
 
-
-my %filter = ( dir => new POE::Filter::Line( Literal => EOL ),
-	       ls  => new POE::Filter::Line( Literal => EOL ),
-	       get => new POE::Filter::Stream()
-	     );
-
 # create a new POE::Component::Client::FTP object
 sub spawn {
   my $class = shift;
   my $sender = $poe_kernel->get_active_session;
-  
+
   croak "$class->spawn requires an event number of argument" if @_ & 1;
-  
+
   my %params = @_;
-  
+
   my $alias = delete $params{Alias};
   croak "$class->spawn requires an alias to start" unless defined $alias;
-  
+
   my $user = delete $params{Username};
   my $pass = delete $params{Password};
 
   my $local_addr = delete $params{LocalAddr};
+  $local_addr = INADDR_ANY unless defined $local_addr;
+
   my $local_port = delete $params{LocalPort};
+  $local_port = 0 unless defined $local_port;
 
   my $remote_addr = delete $params{RemoteAddr};
   croak "$class->spawn requires a RemoteAddr parameter"
@@ -134,13 +153,25 @@ sub spawn {
 
   my $remote_port = delete $params{RemotePort};
   $remote_port = 21 unless defined $remote_port;
-  
+
   my $timeout = delete $params{Timeout};
   $timeout = 120 unless defined $timeout;
-  
+
   my $blocksize = delete $params{BlockSize};
   $blocksize = 10240 unless defined $blocksize;
-  
+
+  my $conn_mode = delete $params{ConnectionMode};
+  $conn_mode = FTP_PASSIVE unless defined $conn_mode;
+
+  my $trans_mode = delete $params{TransferMode};
+  $trans_mode = FTP_MANUAL unless defined $trans_mode;
+
+  my $filters = delete $params{Filters};
+  $filters->{dir} ||= new POE::Filter::Line( Literal => EOL );
+  $filters->{ls}  ||= new POE::Filter::Line( Literal => EOL );
+  $filters->{get} ||= new POE::Filter::Stream();
+  $filters->{put} ||= new POE::Filter::Stream();
+
   my $events = delete $params{Events};
   $events = [] unless defined $events and ref( $events ) eq 'ARRAY';
   my %register;
@@ -156,7 +187,7 @@ sub spawn {
   carp "Unknown parameters: ", join( ', ', sort keys %params )
     if keys %params;
 
-  POE::Session->create ( 
+  POE::Session->create (
     inline_states => map_all($state_map, \&dispatch),
 
     heap => {
@@ -167,8 +198,11 @@ sub spawn {
       local_port      => $local_port,
       remote_addr     => $remote_addr,
       remote_port     => $remote_port,
-      timeout         => $timeout,
-      blocksize       => $blocksize,
+
+      attr_trans_mode => $trans_mode,
+      attr_conn_mode  => $conn_mode,
+      attr_timeout    => $timeout,
+      attr_blocksize  => $blocksize,
 
       cmd_sock_wheel  => undef,
       cmd_rw_wheel    => undef,
@@ -177,6 +211,8 @@ sub spawn {
       data_rw_wheel   => undef,
       data_sock_port  => 0,
       data_suicidal   => 0,
+
+      filters         => $filters,
 
       state           => "_init",
       queue           => [ ],
@@ -194,7 +230,7 @@ sub spawn {
 # connect to address specified during spawn
 sub do_init_start {
   my ($kernel, $heap) = @_[KERNEL, HEAP];
-  
+
   # connect to command port
   $heap->{cmd_sock_wheel} = POE::Wheel::SocketFactory->new(
     SocketDomain   => AF_INET,
@@ -213,9 +249,9 @@ sub do_init_start {
 # client responsibility to ensure things are all complete
 sub do_stop {
   my ($kernel, $heap) = @_[KERNEL, HEAP];
-  
+
   warn "cleaning up" if DEBUG;
-  
+
   delete $heap->{cmd_rw_wheel};
   delete $heap->{cmd_sock_wheel};
   delete $heap->{data_rw_wheel};
@@ -227,23 +263,23 @@ sub do_stop {
 # server responses on command connection
 sub handler_cmd_input {
   my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
-  
+
   warn "< $input" if DEBUG;
 
   my $coderef;
-  
+
   my $major = substr($input, 0, 1);
 
   if ($major == 1) {
     # 1yz   Positive Preliminary reply
-    
+
     $coderef = $state_map->{ $heap->{state} }{preliminary};
   }
   elsif ($major == 2) {
     # 2yz   Positive Completion reply
 
     $coderef = $state_map->{ $heap->{state} }{success};
-   
+
     # if it is "nnn-" then it is a multipart message
     # "nnn " marks the final message for an action
     if ($input =~ /^\d{3} /) {
@@ -302,9 +338,9 @@ sub handler_rename_intermediate {
 
   my $status = substr($input, 0, 3);
   my $line = substr($input, 4);
-  
-  send_event( "rename_partial", 
-	      $status, $line, 
+
+  send_event( "rename_partial",
+	      $status, $line,
 	      $heap->{event}->[1] );
 
   command( $heap->{complex_stack} );
@@ -316,9 +352,9 @@ sub handler_rename_success {
 
   my $status = substr($input, 0, 3);
   my $line = substr($input, 4);
-  
+
   send_event( "rename",
-	      $status, $line, 
+	      $status, $line,
 	      $heap->{event}->[1] );
 
   delete $heap->{complex_stack};
@@ -331,9 +367,9 @@ sub handler_rename_failure {
 
   my $status = substr($input, 0, 3);
   my $line   = substr($input, 4);
-  
-  send_event( "rename_error", 
-	      $status, $line, 
+
+  send_event( "rename_error",
+	      $status, $line,
 	      $heap->{event}->[1] );
 
   delete $heap->{complex_stack};
@@ -349,22 +385,8 @@ sub do_put {
   $heap->{complex_stack} = { command => [$event, @_[ARG0..$#_]],
 			     sendq   => [],
 			   };
-  
-  command("PASV");
-}
 
-# data connection made
-sub handler_put_connected {
-  my ($kernel, $heap, $socket) = @_[KERNEL, HEAP, ARG0];
-
-  $heap->{data_rw_wheel} = POE::Wheel::ReadWrite->new(
-    Handle       => $socket,
-    Filter       => POE::Filter::Stream->new(),
-    InputEvent   => 'data_input',
-    ErrorEvent   => 'data_error',
-    FlushedEvent => 'data_flush'
-  );
-  command($heap->{complex_stack}->{command});
+  establish_data_conn();
 }
 
 # socket flushed, see if socket can be closed
@@ -377,11 +399,11 @@ sub handler_put_flushed {
   # check for suicide and thus will confuse the user if sent
   if ($heap->{complex_stack}->{pending}) {
     $heap->{complex_stack}->{pending} = 0;
-    
+
     send_event( "put_flushed",
 		$heap->{complex_stack}->{last_length},
 		$heap->{complex_stack}->{command}->[1] )
-      if $heap->{complex_stack}->{last_length};  
+      if $heap->{complex_stack}->{last_length};
   }
 
   warn "Q||: " . scalar @{$heap->{complex_stack}->{sendq}} if DEBUG;
@@ -393,74 +415,32 @@ sub handler_put_flushed {
     warn "sending queued packet: " . length ($line) if DEBUG;
 
     $heap->{complex_stack}->{pending} = 1;
-    $heap->{data_rw_wheel}->put($line);   
+    $heap->{data_rw_wheel}->put($line);
     $heap->{complex_stack}->{last_length} = length $line;
   }
   elsif ($heap->{data_suicidal}) {
     warn "killing suicidal socket" . $heap->{data_rw_wheel}->get_driver_out_octets() if DEBUG;
-    
+
     delete $heap->{data_sock_wheel};
     delete $heap->{data_rw_wheel};
     $heap->{data_suicidal} = 0;
 
-    send_event("put_closed", 
+    send_event("put_closed",
 	       $heap->{complex_stack}->{command}->[1]);
     goto_state("ready");
   }
 }
 
-# server acknowledged data connection
-sub handler_put_preliminary {
-  my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
-
-  my $status = substr($input, 0, 3);
-  my $line   = substr($input, 4);
-
-  send_event( "put_ready", $status, $line,
-	      $heap->{complex_stack}->{command}->[1] );
-}
-
-# server acknowledged data connection closed
-sub handler_put_success {
-  my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
-
-  # if its a data connection success, use the default handler to accept it
-  &handler_complex_success;
-
-  # if not, then its in response to the STOR
-  if ($heap->{event}->[0] ne "PASV") {
-    my $status = substr($input, 0, 3);
-    my $line   = substr($input, 4);
-    
-    send_event( "put", $status, $line,
-		$heap->{complex_stack}->{command}->[1] );
-  }
-}
-
-# server responded failure
-sub handler_put_failure {
-  my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
-
-  delete $heap->{data_sock_wheel};
-  delete $heap->{data_rw_wheel};
-
-  my $status = substr($input, 0, 3);
-  my $line   = substr($input, 4);
-
-  send_event( "put_error", $status, $line,
-	      $heap->{complex_stack}->{command}->[1] );
-  goto_state("ready");
-}
-
 # remote end closed data connection
+# in put this in an error, not a normal condition
 sub handler_put_data_error {
   my ($kernel, $heap, $error) = @_[KERNEL, HEAP, ARG0];
 
+  send_event( "put_error", $error,
+	      $heap->{complex_stack}->{command}->[1] );
+
   delete $heap->{data_sock_wheel};
   delete $heap->{data_rw_wheel};
-
-  send_event( "put_error", $error, 
-	      $heap->{complex_stack}->{command}->[1] );
   goto_state("ready");
 }
 
@@ -468,7 +448,7 @@ sub handler_put_data_error {
 sub do_put_data {
   my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
   warn "put: " . length($input) if DEBUG;
-  
+
   # add to send queue
   push @{ $heap->{complex_stack}->{sendq} }, $input;
 
@@ -477,18 +457,18 @@ sub do_put_data {
 	   or $heap->{complex_stack}->{pending} ) {
     $kernel->yield('data_flush');
   }
-  
+
 }
 
 # client request to end STOR command
-sub do_put_close { 
+sub do_put_close {
   my ($kernel, $heap) = @_[KERNEL, HEAP];
   warn "setting suicidal on" if DEBUG;
 
   $heap->{data_suicidal} = 1;
 
   # if close is called when sendq is empty, we'll need to fake a flush
-  unless ( @{ $heap->{complex_stack}->{sendq} } > 0 
+  unless ( @{ $heap->{complex_stack}->{sendq} } > 0
 	   or $heap->{complex_stack}->{pending} ) {
     warn "empty sendq, manually flushing" if DEBUG;
     $kernel->yield('data_flush');
@@ -504,6 +484,7 @@ sub handler_init_connected {
     $heap->{cmd_rw_wheel} = POE::Wheel::ReadWrite->new(
 	Handle     => $socket,
         Filter     => POE::Filter::Line->new( Literal => EOL ),
+        Driver       => POE::Driver::SysRW->new(),
         InputEvent => 'cmd_input',
         ErrorEvent => 'cmd_error'
     );
@@ -515,7 +496,7 @@ sub handler_init_success {
 
   send_event('connected');
   goto_state("login");
-  
+
   if ( defined $heap->{user} and defined $heap->{pass} ) {
     $kernel->yield("login");
   }
@@ -524,12 +505,12 @@ sub handler_init_success {
 # login using parameters specified during spawn or passed in now
 sub do_login_send_username {
   my ($kernel, $heap, $user, $pass) = @_[KERNEL, HEAP, ARG0 .. ARG1];
-  
+
   $heap->{user} = $user unless defined $heap->{user};
   croak "No username defined in login" unless defined $heap->{user};
   $heap->{pass} = $pass unless defined $heap->{pass};
   croak "No password defined in login" unless defined $heap->{pass};
-  
+
   command( [ 'USER', $heap->{user} ] );
   delete $heap->{user};
 }
@@ -537,16 +518,31 @@ sub do_login_send_username {
 # username accepted
 sub do_login_send_password {
   my ($kernel, $heap) = @_[KERNEL, HEAP];
-   
+
   command( [ 'PASS', $heap->{pass} ] );
   delete $heap->{pass};
 }
 
 sub handler_login_success {
-  my ($kernel, $heap) = @_[KERNEL, HEAP];
-  
-  send_event("authenticated");
+  my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
+
+  my $status = substr($input, 0, 3);
+  my $line = substr($input, 4);
+
+  send_event( "authenticated",
+	      $status, $line );
+
   goto_state("ready");
+}
+
+sub handler_login_failure {
+  my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
+
+  my $status = substr($input, 0, 3);
+  my $line = substr($input, 4);
+
+  send_event( "login_error",
+	      $status, $line );
 }
 
 ## default_simple state
@@ -567,12 +563,12 @@ sub handler_simple_success {
 
   my $status = substr($input, 0, 3);
   my $line = substr($input, 4);
-  
-  send_event( lc $heap->{event}->[0], 
-	      $status, $line, 
+
+  send_event( lc $heap->{event}->[0],
+	      $status, $line,
 	      $heap->{event}->[1] );
 
-  if ($input =~ /\d{3} /) {
+  if ($input =~ /^\d{3} /) {
     goto_state("ready");
   }
 }
@@ -583,9 +579,9 @@ sub handler_simple_failure {
 
   my $status = substr($input, 0, 3);
   my $line = substr($input, 4);
-  
-  send_event( lc $heap->{event}->[0] . "_error", 
-	      $status, $line, 
+
+  send_event( lc $heap->{event}->[0] . "_error",
+	      $status, $line,
 	      $heap->{event}->[1] );
 
   goto_state("ready");
@@ -599,9 +595,9 @@ sub do_complex_command {
 
   goto_state("default_complex");
 
-  $heap->{complex_stack} = [ $event, @_[ARG0..$#_] ];
-  
-  command("PASV");
+  $heap->{complex_stack} = { command => [ $event, @_[ARG0..$#_] ] };
+
+  establish_data_conn();
 }
 
 # use the server response only for data connection establishment
@@ -610,12 +606,12 @@ sub do_complex_command {
 sub handler_complex_success {
   my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
   if ($heap->{event}->[0] eq "PASV") {
-    
+
     my (@ip, @port);
     (@ip[0..3], @port[0..1]) = $input =~ /(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)/;
     my $ip = join '.', @ip;
     my $port = $port[0]*256 + $port[1];
-   
+
     $heap->{data_sock_wheel} = POE::Wheel::SocketFactory->new(
       SocketDomain   => AF_INET,
       SocketType     => SOCK_STREAM,
@@ -626,6 +622,9 @@ sub handler_complex_success {
       FailureEvent   => 'data_connect_error'
     );
   }
+  elsif ($heap->{event}->[0] =~ /^PORT/) {
+    command($heap->{complex_stack}->{command});
+  }
 }
 
 # server response for failure
@@ -635,9 +634,9 @@ sub handler_complex_failure {
   my $status = substr($input, 0, 3);
   my $line   = substr($input, 4);
 
-  send_event( $heap->{complex_stack}->[0] . "_error", 
-	      $status, $line, 
-	      $heap->{complex_stack}->[1] );
+  send_event( $heap->{complex_stack}->{command}->[0] . "_error",
+	      $status, $line,
+	      $heap->{complex_stack}->{command}->[1] );
 
   delete $heap->{data_sock_wheel};
   delete $heap->{data_rw_wheel};
@@ -650,8 +649,8 @@ sub handler_complex_preliminary {
   my ($kernel, $heap) = @_[KERNEL, HEAP];
 
   # this message is pretty worthless since _connected is all that matters
-  send_event( $heap->{complex_stack}->[0] . "_server",
-	      $heap->{complex_stack}->[1] );
+  send_event( $heap->{complex_stack}->{command}->[0] . "_server",
+	      $heap->{complex_stack}->{command}->[1] );
 }
 
 # data connection established
@@ -659,23 +658,27 @@ sub handler_complex_connected {
   my ($kernel, $heap, $socket) = @_[KERNEL, HEAP, ARG0];
   
   $heap->{data_rw_wheel} = POE::Wheel::ReadWrite->new(
-    Handle     => $socket,
-    Filter     => $filter{ $heap->{complex_stack}->[0] },
-    InputEvent => 'data_input',
-    ErrorEvent => 'data_error'
+    Handle       => $socket,
+    Filter       => $heap->{filters}->{ $heap->{complex_stack}->{command}->[0] },
+    Driver       => POE::Driver::SysRW->new( BlockSize => $heap->{attr_blocksize} ),
+    InputEvent   => 'data_input',
+    ErrorEvent   => 'data_error',
+    FlushedEvent => 'data_flush'
   );
-    
-  send_event( $heap->{complex_stack}->[0] . "_connected",
-	      $heap->{complex_stack}->[1] );
 
-  command( $heap->{complex_stack} );
-} 
+  send_event( $heap->{complex_stack}->{command}->[0] . "_connected",
+	      $heap->{complex_stack}->{command}->[1] );
+
+  if ($heap->{attr_conn_mode} == FTP_PASSIVE) {
+    command($heap->{complex_stack}->{command});
+  }
+}
 
 # data connection could not be established
 sub handler_complex_connect_error {
   my ($kernel, $heap, $error) = @_[KERNEL, HEAP, ARG0];
-  send_event( $heap->{complex_stack}->[0] . "_error", $error,
-	      $heap->{complex_stack}->[1] );
+  send_event( $heap->{complex_stack}->{command}->[0] . "_error", $error,
+	      $heap->{complex_stack}->{command}->[1] );
 
   delete $heap->{data_sock_wheel};
   delete $heap->{data_rw_wheel};
@@ -687,8 +690,8 @@ sub handler_complex_list_data {
   my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
   warn ">> $input" if DEBUG;
 
-  send_event( $heap->{complex_stack}->[0] . "_data", $input,
-	      $heap->{complex_stack}->[1] );
+  send_event( $heap->{complex_stack}->{command}->[0] . "_data", $input,
+	      $heap->{complex_stack}->{command}->[1] );
 }
 
 # connection was closed, clean up
@@ -696,8 +699,8 @@ sub handler_complex_list_error {
   my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
   warn "error: complex_list: $input" if DEBUG;
 
-  send_event( $heap->{complex_stack}->[0] . "_done",
-	      $heap->{complex_stack}->[1] );
+  send_event( $heap->{complex_stack}->{command}->[0] . "_done",
+	      $heap->{complex_stack}->{command}->[1] );
 
   delete $heap->{data_sock_wheel};
   delete $heap->{data_rw_wheel};
@@ -721,18 +724,18 @@ sub map_all {
 }
 
 # enqueues and incoming signal
-sub enqueue_event { 
+sub enqueue_event {
   my ($kernel, $heap, $state) = @_[KERNEL, HEAP, STATE];
   warn "|| enqueue $state" if DEBUG;
 
   push @{$heap->{queue}}, [ @_ ];
-  
+
 }
 
 # dequeue and dispatch next event
 # in a more general model, this could dequeue the first event
 # that active session knows how to deal with
-sub dequeue_event { 
+sub dequeue_event {
   my $heap = $poe_kernel->get_active_session()->get_heap();
   return unless @{$heap->{queue}};
 
@@ -747,7 +750,7 @@ sub dequeue_event {
 sub dispatch {
   my ($kernel, $heap, $state) = @_[KERNEL, HEAP, STATE];
 
-  my $coderef = ( $state_map->{ $heap->{state} }->{$state} || 
+  my $coderef = ( $state_map->{ $heap->{state} }->{$state} ||
 		  $state_map->{global}->{$state} ||
 		  \&enqueue_event );
 
@@ -786,13 +789,13 @@ sub command {
 
     my $heap = $poe_kernel->get_active_session()->get_heap();
     return unless defined $heap->{cmd_rw_wheel};
-    
+
     $cmd_args = [$cmd_args] unless ref( $cmd_args ) eq 'ARRAY';
     my $command = uc shift( @$cmd_args );
     $state = {} unless defined $state;
-    
+
     unshift @{$heap->{stack}}, [ $command, @$cmd_args ];
- 
+
     $command = $command_map{$command} || $command;
     my $cmdstr = join( ' ', $command, @$cmd_args ? @$cmd_args : () );
 
@@ -813,6 +816,34 @@ sub goto_state {
 
 }
 
+# initiate start of data connection
+sub establish_data_conn {
+  my $heap = $poe_kernel->get_active_session()->get_heap();
+
+  if ($heap->{attr_conn_mode} == FTP_PASSIVE) {
+    command("PASV");
+  }
+  else {
+    $heap->{data_sock_wheel} = POE::Wheel::SocketFactory->new(
+      SocketDomain   => AF_INET,
+      SocketType     => SOCK_STREAM,
+      SocketProtocol => 'tcp',
+      BindAddress    => $heap->{local_addr},
+      BindPort       => $heap->{local_port},
+      SuccessEvent   => 'data_connected',
+      FailureEvent   => 'data_connect_error'
+    );
+    my $socket = $heap->{data_sock_wheel}->getsockname();
+    my ($port, $addr) = sockaddr_in($socket);
+    $addr = inet_ntoa($addr);
+    $addr = "127.0.0.1" if $addr eq "0.0.0.0";
+
+    my @addr = split /\./, $addr;
+    my @port = (int($port / 256), $port % 256);
+    command("PORT " . join ",", @addr, @port);
+  }
+}
+
 1;
 
 __END__
@@ -823,68 +854,68 @@ POE::Component::Client::FTP - Implements an FTP client POE Component
 
 =head1 SYNOPSIS
 
- use POE::Component::Client::FTP;
+use POE::Component::Client::FTP;
 
- POE::Component::Client::FTP->spawn (
+POE::Component::Client::FTP->spawn (
    Alias      => 'ftp',
    Username   => 'test',
    Password   => 'test',
    RemoteAddr => 'localhost',
-   Events     => [ qw( authenticated put_ready put_error put_closed
+   Events     => [ qw( authenticated put_connected put_error put_closed
                        get_connected get_data get_done size ) ]
- );
+);
 
- # we are authenticated
- sub authenticated {
+# we are authenticated
+sub authenticated {
    $poe_kernel->post('ftp', 'command', 'args');
- }
+}
 
- # data cnnection is ready for data
- sub put_ready {
+# data connection is ready for data
+sub put_connected {
    my ($status, $line, $param) = @_[ARG0..ARG3];
 
    open FILE, "/etc/passwd" or die $!;
    $poe_kernel->post('ftp', 'put_data', $_) while (<FILE>);
    close FILE;
    $poe_kernel->post('ftp', 'put_close');
- }
+}
 
- # something bad happened
- sub put_error {
+# something bad happened
+sub put_error {
    my ($error, $param) = @_[ARG0,ARG1];
 
    warn "ERROR: '$error' occured while trying to STOR '$param'";
- }
+}
 
- # data connection closed
- sub put_closed {
+# data connection closed
+sub put_closed {
    my ($param) = @_[ARG0];
- }
+}
 
- # file on the way...
- sub get_connected {
+# file on the way...
+sub get_connected {
    my ($filename) = @_[ARG0];
- }
+}
 
- # getting data from the file...
- sub get_data {
+# getting data from the file...
+sub get_data {
    my ($data, $filename) = @_[ARG0,ARG1];
 
- }
+}
 
- # and its done 
- sub get_done {
+# and its done
+sub get_done {
    my ($filename) = @_[ARG0];
- } 
+}
 
- # response to a size command
- sub size {
+# response to a size command
+sub size {
    my ($code, $size, $filename) = @_[ARG0,ARG1,ARG2];
-  
-   print "$filename was $size";
- }
 
- $poe_kernel->run();
+   print "$filename was $size";
+}
+
+$poe_kernel->run();
 
 Latest version and samples script can be found at:
 L<http://www.wush.net/poe/ftp>
@@ -903,25 +934,38 @@ Untested.
 
 =over
 
-=item Alias      - session name
+=item Alias          - session name
 
-=item Username   - account username
+=item Username       - account username
 
-=item Password   - account password
+=item Password       - account password
 
-=item LocalAddr  - unused
+=item ConnectionMode - FTP_PASSIVE (default) or FTP_ACTIVE  
 
-=item LocalPort  - unused
+=item Transfermode   - FTP_MANUAL (default), FTP_ASCII, or FTP_BINARY
+                       If set to FTP_ASCII OR FTP_BINARY, will use specified
+                       before every file transfer.  If not set, you are
+                       responsible to manually post the mode.
+                       NOTE: THIS IS UNIMPLEMENTED AT THE TIME
 
-=item RemoteAddr - ftp server
+=item Filters        - a hashref matching signals with POE::Filter's
+                       If unspecified, reasonable selections will be made.
+                       Only filter currently useful is for ls, which parses
+                       common ls responses.  See samples/list.pl for example.
 
-=item RemotePort - ftp port
+=item LocalAddr      - interface to listen on in active mode
 
-=item Timeout    - unused
+=item LocalPort      - port to listen on in active mode
 
-=item Blocksize  - unused
+=item RemoteAddr     - ftp server
 
-=item Events     - events you are interested in receiving.  See OUTPUT.
+=item RemotePort     - ftp port
+
+=item Timeout        - unused
+
+=item BlockSize      - sets the recieve buffer size.  see BUGS
+
+=item Events         - events you are interested in receiving.  See OUTPUT.
 
 =back
 
@@ -963,8 +1007,8 @@ Untested.
 
 =item put_data
 
-After receiving a put_ready event you can post put_data events to send data to
-the server.
+After receiving a put_connected event you can post put_data events to send 
+data to the server.
 
 =item put_close
 
@@ -975,7 +1019,7 @@ and closed.
 
 =head1 OUTPUT
 
-Output is for "simple" ftp events is simply "event".  Error cases are 
+Output is for "simple" ftp events is simply "event".  Error cases are
 "event_error".  ARG0 is the numeric code, ARG1 is the text response,
 and ARG2 is the parameter you made the call with.  This is useful since
 commands such as size do not remind you of this in the server response.
@@ -985,9 +1029,10 @@ upon socket connection, "event_data" for each item of data, and "event_done"
 when all data is done being sent.
 
 Output from put is "put_error" for an error creating a connection or
-"put_ready".  If you receive "put_ready" you can post "put_data" commands
-to the component to have it write.  A "put_done" command closes and writes.
-Upon completion, a "put_closed" or "put_error" is posted back to you.
+"put_connected".  If you receive "put_connected" you can post
+"put_data" commands to the component to have it write.  A "put_done"
+command closes and writes.  Upon completion, a "put_closed" or
+"put_error" is posted back to you.
 
 =head1 SEE ALSO
 
@@ -997,33 +1042,54 @@ the POE manpage, the perl manpage, the Net::FTP module, RFC 959
 
 =over
 
+=item High level functions
+
+High level put and get functions which would accept filenames or
+filehandles.  This may simplify creation of an ftp client or batch script.
+
 =item Improve local queueing of send data
 
-Perhaps I should be looking at the high_ and low_ marks given by the Wheel.
-Should also honor the block-size set forth by the spawn.  This is trivial
-by playing with sendq.
-
-=item Active transfer mode
-
-Low priority since I do not really see the importance.
-
 =item More sample scripts and documentation
+
+Eventually a graphical ftp client might be interesting.  Please email me
+if you decide to attempt this.
+
+=item More complete test cases
+
+=item "Meta" functions
+
+Allow get/put functions to be given filenames or filehandles instead of
+requiring the calling script to do standard file io in handlers.
+
+=item Implement TransferMode setting
 
 =back
 
 =head1 BUGS
 
-=over
+=item BlockSize
 
-=item Error checking assumes a closed socket is normal.
+To do the blocksize, I simply rely on the BlockSize parameter in the
+Wheel::ReadWrite.  Although it is honored for receiving data, sending data
+is done as elements in the array.  Possibly change Driver::SysRW or submit
+to the Wheel in proper sizes.  Do not count on receive blocks coming in
+proper sizes.
 
-No way around this I think.  The actual return on failure is off of the server
-response code, so it should be fine.
+=item TransferMode
+
+FTP_ASCII and FTP_BINARY are not implemented.  Use the 'type' command.
+
+=item Active transfer mode
+
+PORT does not know what ip address it is listening on.  It gets 0.0.0.0.  Use
+LocalAddr in the constructor and it all works fine.
 
 =back
 
 =head1 AUTHORS & COPYRIGHT
 
-Copyright (c) 2002 Michael Ching. All rights reserved. This program is free 
-software; you can redistribute it and/or modify it under the same terms as 
-Perl itself. 
+Copyright (c) 2002 Michael Ching. All rights reserved. This program is free
+software; you can redistribute it and/or modify it under the same terms as
+Perl itself.
+
+

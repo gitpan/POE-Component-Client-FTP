@@ -60,7 +60,7 @@ POE::Session->create
 		     get_done      => \&do_download,
 		     get_error     => \&error,
 
-		     put_ready     => \&put_ready,
+		     put_connected => \&put_connected,
 		     put_closed    => \&do_upload,
 		     put_flushed   => \&put_flushed,
 		     put_error     => \&error,
@@ -229,7 +229,7 @@ sub do_upload {
 }
 
 # start the upload
-sub put_ready {
+sub put_connected {
   my ($kernel, $heap, $session, $filename) = @_[KERNEL, HEAP, SESSION, ARG2];
 
   undef $heap->{stor_fh};

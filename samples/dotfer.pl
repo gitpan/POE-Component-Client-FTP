@@ -1,7 +1,7 @@
 #!/usr/bin/perl -w 
 
 # Usage:
-# sync.pl host:user:pass /path/to/file
+# dotfer.pl host:user:pass /path/to/file
 #
 # Shows the lazy way to upload a file letting the module handle
 # all queueing.  sync.pl shows a cleaner way for larger files.
@@ -23,7 +23,7 @@ POE::Session->create
      inline_states => {
 		       _start        => \&start,
 		       authenticated => \&authenticated,
-		       put_ready     => \&put_ready,
+		       put_connected => \&put_connected,
 		       put_closed    => \&put_closed,
 		       put_flushed   => \&put_flushed,
 		       put_error     => \&put_error
@@ -48,7 +48,7 @@ sub authenticated {
     $poe_kernel->post('ftp', 'put', 'test.ftp');
 }
 
-sub put_ready {
+sub put_connected {
   my ($heap) = $_[HEAP];
 
   open FILE, $file or die $!;

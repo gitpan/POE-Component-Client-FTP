@@ -1,5 +1,22 @@
 Revision history for Perl extension POE::Component::Client::FTP.
 
+0.06 (07/15/02)
+  - active mode implemented
+  - more attributes respected
+  - fixed bug where failed login goes to ready state
+  - filters can be specified for complex events such as ls
+  - put and default complex handlers overlap are more generalized
+  - put_ready is now put_connected, interface should solidify by .1
+  - added status line information to login events
+  - updated samples for new put interface
+  - added a list sample which demonstrates incorrect logins and Filters
+  - made code work with older versions of POE
+  - added mode constants
+  - made POE::Filter::Ls helper class, grab it off cpan
+  - problems determining default ip in active mode to interface, see BUGS
+  - 0.07 should be out soon, completing many of the half-implemented
+    features
+
 0.05 (05/25/02)
   - ls and dir now use Filter::Line, get and put use Filter::Stream
   - put_close sends a put_flushed message so that if you close after
