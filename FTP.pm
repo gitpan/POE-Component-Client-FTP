@@ -12,7 +12,7 @@ use warnings;
 use Carp;
 use vars qw($VERSION $poe_kernel);
 
-$VERSION = 0.03;
+$VERSION = 0.04;
 
 use POE qw( Wheel::SocketFactory Wheel::ReadWrite Filter::Stream );
 use Socket;
@@ -58,7 +58,7 @@ my $state_map =
 
     put => { data_connected     => \&handler_put_connected,
 	     data_connect_error => \&handler_complex_connect_error,
-	     data_flush         => \&handler_put_kill_socket,
+	     data_flush         => \&handler_put_flushed,
 	     success            => \&handler_put_success,
 	     preliminary        => \&handler_put_preliminary,
 	     failure            => \&handler_put_failure,
@@ -96,6 +96,8 @@ my %command_map  = ( CD    => "CWD",
 		     GET => "RETR",
 
 		     PUT => "STOR",
+
+		     DELETE => "DELE",
 		   );
 
 # create a new POE::Component::Client::FTP object
@@ -201,7 +203,9 @@ sub do_init_start {
 # client responsibility to ensure things are all complete
 sub do_stop {
   my ($kernel, $heap) = @_[KERNEL, HEAP];
-
+  
+  warn "cleaning up" if DEBUG;
+  
   delete $heap->{cmd_rw_wheel};
   delete $heap->{cmd_sock_wheel};
   delete $heap->{data_rw_wheel};
@@ -332,7 +336,9 @@ sub do_put {
 
   goto_state("put");
 
-  $heap->{complex_stack} = [ $event, @_[ARG0..$#_] ];
+  $heap->{complex_stack} = { command => [$event, @_[ARG0..$#_]],
+			     sendq   => [],
+			   };
   
   command("PASV");
 }
@@ -348,23 +354,41 @@ sub handler_put_connected {
     ErrorEvent   => 'data_error',
     FlushedEvent => 'data_flush'
   );
-  command($heap->{complex_stack});
+  command($heap->{complex_stack}->{command});
 }
 
 # socket flushed, see if socket can be closed
-sub handler_put_kill_socket {
-  my ($kernel, $heap) = @_[KERNEL, HEAP];
+sub handler_put_flushed {
+  my ($kernel, $heap, $session) = @_[KERNEL, HEAP];
 
-  warn "data flushed" if DEBUG;
-  if ($heap->{data_suicidal}) {
-    warn "killing suicidal socket" if DEBUG;
+  warn "data flushed " . $heap->{complex_stack}->{last_length} if DEBUG;
+
+  send_event( "put_flushed",
+	      $heap->{complex_stack}->{last_length},
+	      $heap->{complex_stack}->{command}->[1] )
+    if $heap->{complex_stack}->{last_length};  
+
+  # we use an internal sendq and send lines as each line is sent
+  # this way we can give the user feedback as to the status of the upload
+  # so, whenever data is flushed send the next packet
+  if ( defined(my $line = shift @{$heap->{complex_stack}->{sendq}}) ) {
+    warn "sending queued packet" if DEBUG;
+
+    $heap->{data_rw_wheel}->put($line);
     
+    $kernel->post($session, 'data_flush');
+    
+    $heap->{complex_stack}->{last_length} = length $line;
+  }
+  elsif ($heap->{data_suicidal}) {
+    warn "killing suicidal socket" if DEBUG;
+
     delete $heap->{data_sock_wheel};
     delete $heap->{data_rw_wheel};
     $heap->{data_suicidal} = 0;
 
     send_event("put_closed", 
-	       $heap->{complex_stack}->[1]);
+	       $heap->{complex_stack}->{command}->[1]);
     goto_state("ready");
   }
 }
@@ -377,7 +401,7 @@ sub handler_put_preliminary {
   my $line   = substr($input, 4);
 
   send_event( "put_ready", $status, $line,
-	      $heap->{complex_stack}->[1] );
+	      $heap->{complex_stack}->{command}->[1] );
 }
 
 # server acknowledged data connection closed
@@ -393,7 +417,7 @@ sub handler_put_success {
     my $line   = substr($input, 4);
     
     send_event( "put", $status, $line,
-		$heap->{complex_stack}->[1] );
+		$heap->{complex_stack}->{command}->[1] );
   }
 }
 
@@ -408,7 +432,7 @@ sub handler_put_failure {
   my $line   = substr($input, 4);
 
   send_event( "put_error", $status, $line,
-	      $heap->{complex_stack}->[1] );
+	      $heap->{complex_stack}->{command}->[1] );
   goto_state("ready");
 }
 
@@ -420,16 +444,20 @@ sub handler_put_data_error {
   delete $heap->{data_rw_wheel};
 
   send_event( "put_error", $error, 
-	      $heap->{complex_stack}->[1] );
+	      $heap->{complex_stack}->{command}->[1] );
   goto_state("ready");
 }
 
 # client sending data for us to print to the STOR
 sub do_put_data {
   my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
-  warn "put: $input" if DEBUG;
+  warn "put: " . length($input) if DEBUG;
+  
+  # add to send queue
+  push @{ $heap->{complex_stack}->{sendq} }, $input;
 
-  $heap->{data_rw_wheel}->put($input);
+  # send the first flushed event if this was the first item
+  $kernel->yield('data_flush') if @{ $heap->{complex_stack}->{sendq} } == 1;
 }
 
 # client request to end STOR command
@@ -594,7 +622,8 @@ sub handler_complex_failure {
 sub handler_complex_preliminary {
   my ($kernel, $heap) = @_[KERNEL, HEAP];
 
-  send_event( $heap->{complex_stack}->[0] . "_begin",
+  # this message is pretty worthless since _connected is all that matters
+  send_event( $heap->{complex_stack}->[0] . "_server",
 	      $heap->{complex_stack}->[1] );
 }
 
@@ -773,7 +802,7 @@ POE::Component::Client::FTP - Implements an FTP client POE Component
    Password   => 'test',
    RemoteAddr => 'localhost',
    Events     => [ qw( authenticated put_ready put_error put_closed
-                       get_begin get_data get_done size ) ]
+                       get_connected get_data get_done size ) ]
  );
 
  # we are authenticated
@@ -781,7 +810,7 @@ POE::Component::Client::FTP - Implements an FTP client POE Component
    $poe_kernel->post('ftp', 'command', 'args');
  }
 
- # data connection is ready for data
+ # data cnnection is ready for data
  sub put_ready {
    my ($status, $line, $param) = @_[ARG0..ARG3];
 
@@ -804,7 +833,7 @@ POE::Component::Client::FTP - Implements an FTP client POE Component
  }
 
  # file on the way...
- sub get_begin {
+ sub get_connected {
    my ($filename) = @_[ARG0];
  }
 
@@ -899,7 +928,7 @@ Untested.
 
 =item size [filename]
 
-=item type [ascii binary]
+=item type [A|I]
 
 =item quit
 
@@ -922,7 +951,7 @@ Output is for "simple" ftp events is simply "event".  Error cases are
 and ARG2 is the parameter you made the call with.  This is useful since
 commands such as size do not remind you of this in the server response.
 
-Output for "complex" or data socket ftp commands is creates "event_begin"
+Output for "complex" or data socket ftp commands is creates "event_connection"
 upon socket connection, "event_data" for each item of data, and "event_done"
 when all data is done being sent.
 
@@ -935,13 +964,40 @@ Upon completion, a "put_closed" or "put_error" is posted back to you.
 
 the POE manpage, the perl manpage, the Net::FTP module, RFC 959
 
+=head1 TODO
+
+=over
+
+=item Improve local queueing of send data
+
+Perhaps I should be looking at the high_ and low_ marks given by the Wheel.
+Should also honor the block-size set forth by the spawn.  This is trivial
+by playing with sendq.
+
+=item Ensure that LIST data actually comes line by line
+
+It is going through a Filter->Stream so I am not really sure why it is working,
+but it does so I will look more in depth later.  Might need to conditionally
+use a Filter->Line depending on mode.
+
+=item Active transfer mode
+
+Low priority since I do not really see the importance.
+
+=item More sample scripts and documentation
+
+=back
+
 =head1 BUGS
 
-=item Active mode not supported
+=over
 
-=item Error checking assumes a closed socket is normal.  No way around this.
+=item Error checking assumes a closed socket is normal.
 
-=item Lack of documentation
+No way around this I think.  The actual return on failure is off of the server
+response code, so it should be fine.
+
+=back
 
 =head1 AUTHORS & COPYRIGHT
 

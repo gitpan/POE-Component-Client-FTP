@@ -1,8 +1,18 @@
 Revision history for Perl extension POE::Component::Client::FTP.
 
-0.03 - fixed 'cd' bug where cd was not mapped to cwd
+0.04 (05/23/02)
+  - added POE to prerequisite list, hopefully make test works now
+  - improved handling for put_ using a queue built on top of the Wheel
+  - included a sample script for tracking status of a put
+  - not using _begin anymore since _connected is what we really want
+  - mapped 'delete' to dele, I think thats the last of these...       
 
-0.02 - more information in events outputted
-       added some documentation
+0.03 (05/22/02)
+  - fixed 'cd' bug where cd was not mapped to cwd
 
-0.01 - initial release
+0.02 (05/20/02)
+  - more information in events outputted
+  - added some documentation
+
+0.01 (05/18/02)
+  - initial release
