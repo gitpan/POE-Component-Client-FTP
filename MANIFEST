@@ -1,9 +1,21 @@
 Changes
-FTP.pm
+examples/dotfer.pl
+examples/list.pl
+examples/sync.pl
+inc/Module/Install.pm
+inc/Module/Install/Base.pm
+inc/Module/Install/Can.pm
+inc/Module/Install/Fetch.pm
+inc/Module/Install/Makefile.pm
+inc/Module/Install/Metadata.pm
+inc/Module/Install/Win32.pm
+inc/Module/Install/WriteAll.pm
+lib/POE/Component/Client/FTP.pm
 Makefile.PL
-MANIFEST
+MANIFEST			This list of files
+META.yml
 README
-test.pl
-samples/list.pl
-samples/sync.pl
-samples/dotfer.pl
+t/00_use.t
+t/99_pod.t
+t/99_pod_coverage.t
+t/99_test_kwalitee.t
