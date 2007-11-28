@@ -20,7 +20,7 @@ use POE qw(Wheel::SocketFactory Wheel::ReadWrite
 
 use vars qw(@ISA @EXPORT $VERSION $poe_kernel);
 
-$VERSION = 0.08;
+$VERSION = 0.09;
 
 @ISA = qw(Exporter);
 @EXPORT = qw(FTP_PASSIVE FTP_ACTIVE FTP_MANUAL FTP_ASCII FTP_BINARY);
@@ -28,6 +28,7 @@ $VERSION = 0.08;
 BEGIN {
   eval 'sub DEBUG         () { 0 }' unless defined &DEBUG;
   eval 'sub DEBUG_COMMAND () { 0 }' unless defined &DEBUG_COMMAND;
+  eval 'sub DEBUG_DATA () { 0 }'    unless defined &DEBUG_DATA;
 }
 
 sub EOL         () { "\015\012" }
@@ -54,11 +55,22 @@ my $state_map =
     stop   => { "_start" => \&do_stop
 	      },
 
+    authtls => { "authtls"  => \&do_send_authtls,
+                 "success"  => \&handler_authtls_success,
+                 "failure"  => \&handler_authtls_failure
+              },
+
     login  => { "login"        => \&do_login_send_username,
 		"intermediate" => \&do_login_send_password,
 		"success"      => \&handler_login_success,
 		"failure"      => \&handler_login_failure
 	      },
+
+    pbsz_prot => { "pbsz"    => \&do_send_pbsz,
+                   "prot"    => \&do_send_prot,
+                   "success" => \&handler_pbsz_prot_success,
+                   "failure" => \&handler_pbsz_prot_failure
+              },
 
     global => { "cmd_input" => \&handler_cmd_input,
 		"cmd_error" => \&handler_cmd_error
@@ -70,7 +82,7 @@ my $state_map =
 
 		map ( { $_ => \&do_simple_command }
 		      qw{ cd cdup delete mdtm mkdir noop
-			  pwd rmdir site size type quit }
+			  pwd rmdir site size stat type quit quot }
 		    ),
 
 		map ( { $_ => \&do_complex_command }
@@ -157,6 +169,12 @@ sub spawn {
   my $remote_port = delete $params{RemotePort};
   $remote_port = 21 unless defined $remote_port;
 
+  my $tlscmd = delete $params{TLS};
+  $tlscmd = 0 unless defined $tlscmd;
+
+  my $tlsdata = delete $params{TLSData};
+  $tlsdata = 0 unless defined $tlsdata;
+
   my $timeout = delete $params{Timeout};
   $timeout = 120 unless defined $timeout;
 
@@ -189,6 +207,15 @@ sub spawn {
   # Make sure the user didn't make a typo on parameters
   carp "Unknown parameters: ", join( ', ', sort keys %params )
     if keys %params;
+  
+  eval {
+     require IO::Socket::SSL if $tlscmd || $tlsdata;
+  };
+
+  if ($@) {
+	warn "TLS option specified, but IO::Socket::SSL not found\n";
+	$tlscmd = 0; $tlsdata = 0;
+  }
 
   POE::Session->create (
     inline_states => map_all($state_map, \&dispatch),
@@ -202,6 +229,8 @@ sub spawn {
       remote_addr     => $remote_addr,
       remote_port     => $remote_port,
 
+      tlscmd          => $tlscmd,
+      tlsdata         => $tlsdata,
       attr_trans_mode => $trans_mode,
       attr_conn_mode  => $conn_mode,
       attr_timeout    => $timeout,
@@ -235,7 +264,7 @@ sub do_init_start {
   my ($kernel, $heap) = @_[KERNEL, HEAP];
 
   # set timeout for connection
-  $kernel->delay( "timeout", $heap->{attr_timeout} );
+  $kernel->delay( "timeout", $heap->{attr_timeout}, undef, undef, "Timeout ($heap->{attr_timeout} seconds)" );
 
   # connect to command port
   $heap->{cmd_sock_wheel} = POE::Wheel::SocketFactory->new(
@@ -270,15 +299,22 @@ sub do_stop {
 sub handler_cmd_input {
   my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
 
-  warn "< $input" if DEBUG;
+  warn "<<< $input\n" if DEBUG_COMMAND;
 
   my $coderef;
 
-  my $reply = substr($input, 0, 4);
+  $input =~ s/^(\d\d\d)(.?)//o;
+  my ($code, $more) = ($1, $2);
 
-  return unless $reply =~ /\s$/;
+  $input =~ s/^ // if defined $more && $more eq "-";
 
-  my $major = substr($input, 0, 1);
+  $heap->{ftp_message} .= "$input\n";
+    
+  return unless defined $code && defined $more && $more eq " ";
+
+  $heap->{ftp_message} =~ s/\s+$//;
+
+  my $major = substr($code, 0, 1);
 
   if ($major == 1) {
     # 1yz   Positive Preliminary reply
@@ -289,34 +325,24 @@ sub handler_cmd_input {
     # 2yz   Positive Completion reply
 
     $coderef = $state_map->{ $heap->{state} }{success};
-
-    # if it is "nnn-" then it is a multipart message
-    # "nnn " marks the final message for an action
-    if ($input =~ /^\d{3} /) {
-      $heap->{event} = pop( @{$heap->{stack}} ) || ['none', {}];
-    }
+    $heap->{event} = pop( @{$heap->{stack}} ) || ['none', {}];
   }
   elsif ($major == 3) {
     # 3yz   Positive Intermediate reply
 
     $coderef = $state_map->{ $heap->{state} }{intermediate};
-
-    if ($input =~ /^\d{3} /) {
-      $heap->{event} = pop( @{$heap->{stack}} ) || ['none', {}];
-    }
+    $heap->{event} = pop( @{$heap->{stack}} ) || ['none', {}];
   }
   else {
      # 4yz   Transient Negative Completion reply
      # 5yz   Permanent Negative Completion reply
 
     $coderef = $state_map->{ $heap->{state} }{failure};
-
-    if ($input =~ /^\d{3} /) {
-      $heap->{event} = pop( @{$heap->{stack}} ) || ['none', {}];
-    }
+    $heap->{event} = pop( @{$heap->{stack}} ) || ['none', {}];
   }
 
   &{ $coderef }(@_) if $coderef;
+  delete $heap->{ftp_message};
 }
 
 
@@ -524,11 +550,46 @@ sub handler_init_success {
   send_event( "connected", 
 	      $status, $line );
 
-  goto_state("login");
 
-  if ( defined $heap->{user} and defined $heap->{pass} ) {
-    $kernel->yield("login");
+  if ($heap->{tlscmd}) {
+    goto_state("authtls");
+    $kernel->yield("authtls");
   }
+  else {
+    goto_state("login");
+
+    if ( defined $heap->{user} and defined $heap->{pass} ) {
+      $kernel->yield("login");
+    }
+  }
+}
+
+# start the tls negotiation on the control connection by sending "AUTH TLS"
+sub do_send_authtls {
+    my ($kernel, $heap) = @_[KERNEL, HEAP];
+    command( [ 'AUTH', 'TLS'] );
+}
+
+sub handler_authtls_success {
+  my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
+
+  my $sock =  @{$heap->{cmd_rw_wheel}}[0];
+
+  IO::Socket::SSL->start_SSL( $sock, SSL_version => "TLSv1" )
+    or croak IO::Socket::SSL::errstr();
+
+  goto_state("login");
+  $kernel->yield("login");
+}
+
+sub handler_authtls_failure {
+  my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
+
+  my $status = substr($input, 0, 3);
+  my $line   = substr($input, 4);
+
+  send_event( "login_error",
+              $status, $line );
 }
 
 # login using parameters specified during spawn or passed in now
@@ -558,10 +619,16 @@ sub handler_login_success {
   my $status = substr($input, 0, 3);
   my $line = substr($input, 4);
 
-  send_event( "authenticated",
-	      $status, $line );
+  if ($heap->{tlsdata}) {
+    goto_state("pbsz_prot");
+    $kernel->yield('pbsz');
+  }
+  else {
+    send_event( "authenticated",
+              $status, $line );
 
-  goto_state("ready");
+    goto_state("ready");
+  }
 }
 
 sub handler_login_failure {
@@ -572,6 +639,46 @@ sub handler_login_failure {
 
   send_event( "login_error",
 	      $status, $line );
+}
+
+
+# PBSZ 0 and PROT P are needed to encrypt the data connection (specified with TLSData)
+# this is done _before_ 'authenticated' is sent to the user session (even though the u/p is already accepted)
+
+sub do_send_pbsz {#
+    my ($kernel, $heap) = @_[KERNEL, HEAP];
+    command( [ 'PBSZ', '0' ] );
+}
+
+sub do_send_prot {#
+    my ($kernel, $heap) = @_[KERNEL, HEAP];
+    command( [ 'PROT', 'P' ] );
+}
+
+
+sub handler_pbsz_prot_success {
+  my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
+
+  if ($heap->{event}->[0] eq "PBSZ") {
+    $kernel->yield("prot");
+  }
+  else {
+    my $status = substr($input, 0, 3);
+    my $line = substr($input, 4);
+
+    send_event( "authenticated", $status, $line );
+    goto_state("ready");
+  }
+}
+
+sub handler_pbsz_prot_failure {
+  my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
+
+  my $status = substr($input, 0, 3);
+  my $line   = substr($input, 4);
+
+  send_event( "login_error",
+              $status, $line );
 }
 
 ## default_simple state
@@ -591,15 +698,12 @@ sub handler_simple_success {
   my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
 
   my $status = substr($input, 0, 3);
-  my $line = substr($input, 4);
 
   send_event( lc $heap->{event}->[0],
-	      $status, $line,
+	      $status, $heap->{ftp_message},
 	      $heap->{event}->[1] );
 
-  if ($input =~ /^\d{3} /) {
-    goto_state("ready");
-  }
+  goto_state("ready");
 }
 
 # server response for failure
@@ -654,6 +758,11 @@ sub handler_complex_success {
   elsif ($heap->{event}->[0] =~ /^PORT/) {
     command($heap->{complex_stack}->{command});
   }
+  else {
+    send_event( $heap->{complex_stack}->{command}->[0] . "_done",
+                $heap->{complex_stack}->{command}->[1] );
+    goto_state("ready");
+  }
 }
 
 # server response for failure
@@ -680,6 +789,8 @@ sub handler_complex_preliminary {
   # this message is pretty worthless since _connected is all that matters
   send_event( $heap->{complex_stack}->{command}->[0] . "_server",
 	      $heap->{complex_stack}->{command}->[1] );
+
+  IO::Socket::SSL->start_SSL( @{$heap->{data_rw_wheel}}[0] );
 }
 
 # data connection established
@@ -717,23 +828,19 @@ sub handler_complex_connect_error {
 # getting actual data, so send it to the client
 sub handler_complex_list_data {
   my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
-  warn ">> $input" if DEBUG;
+  warn "<< $input\n" if DEBUG_DATA;
 
   send_event( $heap->{complex_stack}->{command}->[0] . "_data", $input,
 	      $heap->{complex_stack}->{command}->[1] );
 }
 
-# connection was closed, clean up
+# connection was closed, clean up, and wait for a response from the server
 sub handler_complex_list_error {
   my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
   warn "error: complex_list: $input" if DEBUG;
 
-  send_event( $heap->{complex_stack}->{command}->[0] . "_done",
-	      $heap->{complex_stack}->{command}->[1] );
-
   delete $heap->{data_sock_wheel};
   delete $heap->{data_rw_wheel};
-  goto_state("ready");
 }
 
 ## utility functions
@@ -825,10 +932,13 @@ sub command {
 
     unshift @{$heap->{stack}}, [ $command, @$cmd_args ];
 
+    $command = shift( @$cmd_args ) if $command eq "QUOT";
+ 
     $command = $command_map{$command} || $command;
     my $cmdstr = join( ' ', $command, @$cmd_args ? @$cmd_args : () );
+ 
+    warn ">>> $cmdstr\n" if DEBUG_COMMAND;
 
-    warn "> $cmdstr" if DEBUG || DEBUG_COMMAND;
     $heap->{cmd_rw_wheel}->put($cmdstr);
 }
 
@@ -1002,7 +1112,13 @@ Untested.
 
 =item Events         - events you are interested in receiving.  See OUTPUT.
 
+=item TLS	     - Set to true for TLS supporting servers.
+
+=item TLSData	     - Set to true for TLS supporting servers of data connections.
+
 =back
+
+TLS support requires the L<IO::Socket::SSL> module to be installed.
 
 =head1 INPUT
 
@@ -1036,9 +1152,13 @@ Untested.
 
 =item size [filename]
 
+=item stat [command]
+
 =item type [A|I]
 
 =item quit
+
+=item quot [command]
 
 =item put_data
 
@@ -1129,6 +1249,8 @@ PORT does not know what ip address it is listening on.  It gets 0.0.0.0.  Use
 LocalAddr in the constructor and it all works fine.
 
 =back
+
+Please report any other bugs through C<bug-POE-Component-Client-FTP@rt.cpan.org>
 
 =head1 AUTHORS & COPYRIGHT
 

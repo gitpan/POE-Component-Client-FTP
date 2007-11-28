@@ -19,4 +19,4 @@ requires:
   Carp: 0
   POE: 0.38
   Socket: 0
-version: 0.08
+version: 0.09

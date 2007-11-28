@@ -1,5 +1,28 @@
 Revision history for Perl extension POE::Component::Client::FTP.
 
+0.09 (11/27/07) sc_
+  - Added the "quot" command, which sends any raw command to the sever.
+    "quot" is called on success "quot_error" on failure.
+  - Added the "stat" command. Some servers supports e.g directory listing on the control channel
+    with e.g "STAT -la dirname". Responses to this command often contain lines without a reply code,
+    there was no support for this earlier.
+  - Added the internal "authtls" state that issues "AUTH TLS" to the server before we log in
+    in order to initiate encryption on the command channel.
+    The TLS negotiation is started when a response to this command is recieved.
+  - Multiline responses are now sent to the handlers for simple commands (cd, delete, site, etc),
+    earlier only the last line of a response was returned
+  - The DEBUG_COMMAND debug mode now prints (in Net::FTP style) the text sent both to and from the
+    server on the command channel. Earlier it only printed commands sent to the server.
+  - The new DEBUG_DATA debug mode prints everything recieved on the data channel. (DEBUG did this earlier)
+  - The _done response for complex commands (ls dir put) are now sent to
+    the client first when a positive response (226) is recieved. Earlier it called e.g ls_done
+    as soon as the data connection was closed
+  - A timeout error string, e.g "Timeout (120 seconds)", are now sent to the connect_error event
+    on timeouts
+
+0.08 (11/17/07) bingos
+  - Fixed issues with multi-line replies
+
 0.07 (08/25/02)
   - connected now posts the server message, that should be the last of those
   - updated samples/list.pl to test connect message
