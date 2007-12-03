@@ -20,7 +20,7 @@ use POE qw(Wheel::SocketFactory Wheel::ReadWrite
 
 use vars qw(@ISA @EXPORT $VERSION $poe_kernel);
 
-$VERSION = 0.09;
+$VERSION = '0.10';
 
 @ISA = qw(Exporter);
 @EXPORT = qw(FTP_PASSIVE FTP_ACTIVE FTP_MANUAL FTP_ASCII FTP_BINARY);
@@ -790,7 +790,7 @@ sub handler_complex_preliminary {
   send_event( $heap->{complex_stack}->{command}->[0] . "_server",
 	      $heap->{complex_stack}->{command}->[1] );
 
-  IO::Socket::SSL->start_SSL( @{$heap->{data_rw_wheel}}[0] );
+  IO::Socket::SSL->start_SSL( @{$heap->{data_rw_wheel}}[0] ) if $heap->{tlsdata};
 }
 
 # data connection established

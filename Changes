@@ -1,5 +1,9 @@
 Revision history for Perl extension POE::Component::Client::FTP.
 
+0.10 (12/03/07) bingos
+  - Fixed a bug introduced with the TLS support for data connections
+  - Added optional requirement of IO::Socket::SSL to Makefile.PL
+
 0.09 (11/27/07) sc_
   - Added the "quot" command, which sends any raw command to the sever.
     "quot" is called on success "quot_error" on failure.
