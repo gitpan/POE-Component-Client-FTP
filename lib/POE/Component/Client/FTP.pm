@@ -20,7 +20,7 @@ use POE qw(Wheel::SocketFactory Wheel::ReadWrite
 
 use vars qw(@ISA @EXPORT $VERSION $poe_kernel);
 
-$VERSION = '0.10';
+$VERSION = '0.12';
 
 @ISA = qw(Exporter);
 @EXPORT = qw(FTP_PASSIVE FTP_ACTIVE FTP_MANUAL FTP_ASCII FTP_BINARY);
@@ -209,18 +209,16 @@ sub spawn {
     if keys %params;
   
   eval {
-     require IO::Socket::SSL if $tlscmd || $tlsdata;
+     require POE::Component::SSLify if $tlscmd || $tlsdata;
+     import POE::Component::SSLify qw( Client_SSLify );
   };
 
   if ($@) {
-	warn "TLS option specified, but IO::Socket::SSL not found\n";
+	warn "TLS option specified, but there was a problem\n";
 	$tlscmd = 0; $tlsdata = 0;
   }
 
-  POE::Session->create (
-    inline_states => map_all($state_map, \&dispatch),
-
-    heap => {
+  my $self = bless {
       alias           => $alias,
       user            => $user,
       pass            => $pass,
@@ -255,14 +253,20 @@ sub spawn {
       complex_stack   => [ ],
 
       events          => { $sender => \%register }
-    }
-  );
+  }, $class;
+  
+  $self->{session_id} = POE::Session->create (
+    inline_states => map_all($state_map, \&dispatch),
+
+    heap => $self,
+  )->ID();
+  return $self;
 }
 
 # connect to address specified during spawn
 sub do_init_start {
-  my ($kernel, $heap) = @_[KERNEL, HEAP];
-
+  my ($kernel, $session, $heap) = @_[KERNEL, SESSION, HEAP];
+  $heap->{session_id} = $session->ID();
   # set timeout for connection
   $kernel->delay( "timeout", $heap->{attr_timeout}, undef, undef, "Timeout ($heap->{attr_timeout} seconds)" );
 
@@ -278,6 +282,7 @@ sub do_init_start {
   );
 
   $kernel->alias_set( $heap->{alias} );
+  return;
 }
 
 # try to clean up
@@ -293,6 +298,7 @@ sub do_stop {
   delete $heap->{data_sock_wheel};
 
   $poe_kernel->alias_remove( $heap->{alias} );
+  return;
 }
 
 # server responses on command connection
@@ -343,6 +349,7 @@ sub handler_cmd_input {
 
   &{ $coderef }(@_) if $coderef;
   delete $heap->{ftp_message};
+  return;
 }
 
 
@@ -351,6 +358,7 @@ sub handler_cmd_error {
   my ($kernel, $heap) = @_[KERNEL, HEAP];
 
   goto_state("stop");
+  return;
 }
 
 ## state specific
@@ -366,6 +374,7 @@ sub do_rename {
 
   $heap->{complex_stack} = [ "RNTO", $to ];
   command( [ "RNFR", $fr ] );
+  return;
 }
 
 # successful RNFR
@@ -380,6 +389,7 @@ sub handler_rename_intermediate {
 	      $heap->{event}->[1] );
 
   command( $heap->{complex_stack} );
+  return;
 }
 
 # successful RNTO
@@ -395,6 +405,7 @@ sub handler_rename_success {
 
   delete $heap->{complex_stack};
   goto_state("ready");
+  return;
 }
 
 # failed RNFR or RNTO
@@ -410,6 +421,7 @@ sub handler_rename_failure {
 
   delete $heap->{complex_stack};
   goto_state("ready");
+  return;
 }
 
 # initiate a STOR command
@@ -423,6 +435,7 @@ sub do_put {
 			   };
 
   establish_data_conn();
+  return;
 }
 
 # socket flushed, see if socket can be closed
@@ -465,6 +478,7 @@ sub handler_put_flushed {
 	       $heap->{complex_stack}->{command}->[1]);
     goto_state("ready");
   }
+  return;
 }
 
 # remote end closed data connection
@@ -478,6 +492,7 @@ sub handler_put_data_error {
   delete $heap->{data_sock_wheel};
   delete $heap->{data_rw_wheel};
   goto_state("ready");
+  return;
 }
 
 # client sending data for us to print to the STOR
@@ -486,6 +501,8 @@ sub do_put_data {
   warn "put: " . length($input) if DEBUG;
 
   # add to send queue
+
+  $kernel->call('cmd_connected', @{$heap->{cmd_sock_wheel}}[0]);
   push @{ $heap->{complex_stack}->{sendq} }, $input;
 
   # send the first flushed event if this was the first item
@@ -493,7 +510,7 @@ sub do_put_data {
 	   or $heap->{complex_stack}->{pending} ) {
     $kernel->yield('data_flush');
   }
-
+  return;
 }
 
 # client request to end STOR command
@@ -509,6 +526,7 @@ sub do_put_close {
     warn "empty sendq, manually flushing" if DEBUG;
     $kernel->yield('data_flush');
   }
+  return;
 }
 
 ## login state
@@ -527,6 +545,7 @@ sub handler_init_connected {
         InputEvent => 'cmd_input',
         ErrorEvent => 'cmd_error'
     );
+  return;
 }
 
 # connect to server failed, clean up
@@ -538,6 +557,7 @@ sub handler_init_error {
 
     delete $heap->{cmd_sock_wheel};
     send_event( "connect_error", $errnum, $errstr );
+  return;
 }
 
 # wheel established, log in if we can
@@ -562,24 +582,40 @@ sub handler_init_success {
       $kernel->yield("login");
     }
   }
+  return;
 }
 
 # start the tls negotiation on the control connection by sending "AUTH TLS"
 sub do_send_authtls {
     my ($kernel, $heap) = @_[KERNEL, HEAP];
     command( [ 'AUTH', 'TLS'] );
+  return;
 }
 
 sub handler_authtls_success {
   my ($kernel, $heap, $input) = @_[KERNEL, HEAP, ARG0];
 
-  my $sock =  @{$heap->{cmd_rw_wheel}}[0];
+  my $socket = $heap->{cmd_rw_wheel}->get_input_handle();
+  delete $heap->{cmd_rw_wheel};
 
-  IO::Socket::SSL->start_SSL( $sock, SSL_version => "TLSv1" )
-    or croak IO::Socket::SSL::errstr();
+  eval { $socket = Client_SSLify( $socket, 'tlsv1' )};
+  if ( $@ ) {
+    die "Unable to SSLify control connection: $@";
+  }
+
+  # set up the rw wheel again
+
+  $heap->{cmd_rw_wheel} = POE::Wheel::ReadWrite->new(
+      Handle     => $socket,
+      Filter     => POE::Filter::Line->new( Literal => EOL ),
+      Driver     => POE::Driver::SysRW->new(),
+      InputEvent => 'cmd_input',
+      ErrorEvent => 'cmd_error'
+  );
 
   goto_state("login");
   $kernel->yield("login");
+  return;
 }
 
 sub handler_authtls_failure {
@@ -590,6 +626,7 @@ sub handler_authtls_failure {
 
   send_event( "login_error",
               $status, $line );
+  return;
 }
 
 # login using parameters specified during spawn or passed in now
@@ -603,6 +640,7 @@ sub do_login_send_username {
 
   command( [ 'USER', $heap->{user} ] );
   delete $heap->{user};
+  return;
 }
 
 # username accepted
@@ -611,6 +649,7 @@ sub do_login_send_password {
 
   command( [ 'PASS', $heap->{pass} ] );
   delete $heap->{pass};
+  return;
 }
 
 sub handler_login_success {
@@ -629,6 +668,7 @@ sub handler_login_success {
 
     goto_state("ready");
   }
+  return;
 }
 
 sub handler_login_failure {
@@ -639,6 +679,7 @@ sub handler_login_failure {
 
   send_event( "login_error",
 	      $status, $line );
+  return;
 }
 
 
@@ -648,11 +689,13 @@ sub handler_login_failure {
 sub do_send_pbsz {#
     my ($kernel, $heap) = @_[KERNEL, HEAP];
     command( [ 'PBSZ', '0' ] );
+  return;
 }
 
 sub do_send_prot {#
     my ($kernel, $heap) = @_[KERNEL, HEAP];
     command( [ 'PROT', 'P' ] );
+  return;
 }
 
 
@@ -669,6 +712,7 @@ sub handler_pbsz_prot_success {
     send_event( "authenticated", $status, $line );
     goto_state("ready");
   }
+  return;
 }
 
 sub handler_pbsz_prot_failure {
@@ -679,6 +723,7 @@ sub handler_pbsz_prot_failure {
 
   send_event( "login_error",
               $status, $line );
+  return;
 }
 
 ## default_simple state
@@ -690,6 +735,7 @@ sub do_simple_command {
   goto_state("default_simple");
 
   command( [ $event, @_[ARG0..$#_] ] );
+  return;
 }
 
 # end of response section will be marked by "\d{3} " whereas multipart
@@ -704,6 +750,7 @@ sub handler_simple_success {
 	      $heap->{event}->[1] );
 
   goto_state("ready");
+  return;
 }
 
 # server response for failure
@@ -718,6 +765,7 @@ sub handler_simple_failure {
 	      $heap->{event}->[1] );
 
   goto_state("ready");
+  return;
 }
 
 ## default_complex state
@@ -731,6 +779,7 @@ sub do_complex_command {
   $heap->{complex_stack} = { command => [ $event, @_[ARG0..$#_] ] };
 
   establish_data_conn();
+  return;
 }
 
 # use the server response only for data connection establishment
@@ -763,6 +812,7 @@ sub handler_complex_success {
                 $heap->{complex_stack}->{command}->[1] );
     goto_state("ready");
   }
+  return;
 }
 
 # server response for failure
@@ -780,6 +830,7 @@ sub handler_complex_failure {
   delete $heap->{data_rw_wheel};
 
   goto_state("ready");
+  return;
 }
 
 # connection announced by server
@@ -790,7 +841,26 @@ sub handler_complex_preliminary {
   send_event( $heap->{complex_stack}->{command}->[0] . "_server",
 	      $heap->{complex_stack}->{command}->[1] );
 
-  IO::Socket::SSL->start_SSL( @{$heap->{data_rw_wheel}}[0] ) if $heap->{tlsdata};
+  # sslify the data connection
+  my $socket = $heap->{data_rw_wheel}->get_input_handle();
+  delete $heap->{data_rw_wheel};
+  eval { $socket = Client_SSLify( $socket, 'tlsv1' )};
+  if ( $@ ) {
+    die "Unable to SSLify data connection: $@";
+  }
+
+  # set up the rw wheel again
+
+  $heap->{data_rw_wheel} = POE::Wheel::ReadWrite->new(
+    Handle       => $socket,
+    Filter       => $heap->{filters}->{ $heap->{complex_stack}->{command}->[0] },
+    Driver       => POE::Driver::SysRW->new( BlockSize => $heap->{attr_blocksize} ),
+    InputEvent   => 'data_input',
+    ErrorEvent   => 'data_error',
+    FlushedEvent => 'data_flush'
+  );
+
+  return;
 }
 
 # data connection established
@@ -812,6 +882,7 @@ sub handler_complex_connected {
   if ($heap->{attr_conn_mode} == FTP_PASSIVE) {
     command($heap->{complex_stack}->{command});
   }
+  return;
 }
 
 # data connection could not be established
@@ -823,6 +894,7 @@ sub handler_complex_connect_error {
   delete $heap->{data_sock_wheel};
   delete $heap->{data_rw_wheel};
   goto_state("ready");
+  return;
 }
 
 # getting actual data, so send it to the client
@@ -832,6 +904,7 @@ sub handler_complex_list_data {
 
   send_event( $heap->{complex_stack}->{command}->[0] . "_data", $input,
 	      $heap->{complex_stack}->{command}->[1] );
+  return;
 }
 
 # connection was closed, clean up, and wait for a response from the server
@@ -841,6 +914,7 @@ sub handler_complex_list_error {
 
   delete $heap->{data_sock_wheel};
   delete $heap->{data_rw_wheel};
+  return;
 }
 
 ## utility functions
@@ -893,6 +967,7 @@ sub dispatch {
 
   warn "-> $heap->{state}\::$state" if DEBUG;
   &{ $coderef }(@_);
+  return;
 }
 
 # Send events to interested sessions
@@ -915,6 +990,7 @@ sub send_event {
             );
         }
     }
+  return;
 }
 
 # run a command and add its call information to the call stack
@@ -981,6 +1057,7 @@ sub establish_data_conn {
     my @port = (int($port / 256), $port % 256);
     command("PORT " . join ",", @addr, @port);
   }
+  return;
 }
 
 1;
@@ -1118,7 +1195,7 @@ Untested.
 
 =back
 
-TLS support requires the L<IO::Socket::SSL> module to be installed.
+TLS support requires the L<POE::Component::SSLify> module to be installed.
 
 =head1 INPUT
 
